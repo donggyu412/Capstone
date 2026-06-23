@@ -222,7 +222,7 @@ public class DrawingController : MonoBehaviour
             1f);
 
         // 2차 베지어 곡선을 여러 점으로 샘플링
-        List<Vector2> path = new List<Vector2>();
+        List<Vector2> path = new List<Vector2>(strokeSampleCount + 1);
         int samples = strokeSampleCount;
         for (int i = 0; i <= samples; i++)
         {
@@ -311,6 +311,16 @@ public class DrawingController : MonoBehaviour
 
     private List<StrokeGroup> lastBuiltGroups = new List<StrokeGroup>();
 
+    // ─────────────────────────────────────────────────────────────
+    // [최적화] 엣지 픽셀 추출 + 경로 잇기
+    //
+    // 변경점:
+    //  1) 색상거리 계산에서 Mathf.Sqrt 제거 (비교 목적이라 제곱값이면 충분)
+    //     → 이미지 전체(W×H) 픽셀에 대해 픽셀당 최대 8회 호출되던 sqrt 제거
+    //  2) 경로 잇기(최근접 미사용 점 탐색)를 O(N²) 전체 선형탐색에서
+    //     공간 그리드(spatial hash grid) 기반 O(N)에 가깝게 변경
+    //     → 엣지 픽셀 수가 많아질수록(고해상도/낮은 threshold) 체감 효과 큼
+    // ─────────────────────────────────────────────────────────────
     List<StrokeGroup> BuildStrokeGroups(Texture2D image)
     {
         lastBuiltGroups = new List<StrokeGroup>();
@@ -345,18 +355,19 @@ public class DrawingController : MonoBehaviour
 
                     float gx = -tl - 2 * ml - bl2 + tr + 2 * mr + br2;
                     float gy = -tl - 2 * tm - tr + bl2 + 2 * bm + br2;
-                    g = Mathf.Sqrt(gx * gx + gy * gy);
+                    // sqrt 제거: 임계값 비교용이므로 제곱 크기로 충분 (단조 변환)
+                    g = gx * gx + gy * gy;
                 }
                 else
                 {
-                    float dTl = ColorDistance(pixels[(y - 1) * imgW + (x - 1)], c);
-                    float dTm = ColorDistance(pixels[(y - 1) * imgW + x], c);
-                    float dTr = ColorDistance(pixels[(y - 1) * imgW + (x + 1)], c);
-                    float dMl = ColorDistance(pixels[y * imgW + (x - 1)], c);
-                    float dMr = ColorDistance(pixels[y * imgW + (x + 1)], c);
-                    float dBl2 = ColorDistance(pixels[(y + 1) * imgW + (x - 1)], c);
-                    float dBm = ColorDistance(pixels[(y + 1) * imgW + x], c);
-                    float dBr2 = ColorDistance(pixels[(y + 1) * imgW + (x + 1)], c);
+                    float dTl = ColorDistanceSq(pixels[(y - 1) * imgW + (x - 1)], c);
+                    float dTm = ColorDistanceSq(pixels[(y - 1) * imgW + x], c);
+                    float dTr = ColorDistanceSq(pixels[(y - 1) * imgW + (x + 1)], c);
+                    float dMl = ColorDistanceSq(pixels[y * imgW + (x - 1)], c);
+                    float dMr = ColorDistanceSq(pixels[y * imgW + (x + 1)], c);
+                    float dBl2 = ColorDistanceSq(pixels[(y + 1) * imgW + (x - 1)], c);
+                    float dBm = ColorDistanceSq(pixels[(y + 1) * imgW + x], c);
+                    float dBr2 = ColorDistanceSq(pixels[(y + 1) * imgW + (x + 1)], c);
 
                     g = (dTl + dTm + dTr + dMl + dMr + dBl2 + dBm + dBr2) / 8f;
                 }
@@ -375,8 +386,24 @@ public class DrawingController : MonoBehaviour
 
         Debug.Log("엣지 픽셀 수: " + edgePixels.Count + " (threshold=" + edgeThreshold.ToString("F4") + ", maxEdge=" + maxEdge.ToString("F4") + ")");
 
-        bool[] used = new bool[edgePixels.Count];
+        // ── 공간 그리드 구축: 셀 크기 = searchRadius ─────────────
+        // 이렇게 하면 "반경 내 최근접 점" 탐색 시 자기 셀 + 인접 8셀만 보면 됨
         int searchRadius = samplingStep * 3;
+        int cellSize = Mathf.Max(1, searchRadius);
+        var grid = new Dictionary<Vector2Int, List<int>>();
+        for (int idx = 0; idx < edgePixels.Count; idx++)
+        {
+            Vector2Int cell = new Vector2Int(edgePixels[idx].x / cellSize, edgePixels[idx].y / cellSize);
+            if (!grid.TryGetValue(cell, out var list))
+            {
+                list = new List<int>();
+                grid[cell] = list;
+            }
+            list.Add(idx);
+        }
+
+        bool[] used = new bool[edgePixels.Count];
+        float searchRadiusSq = (float)searchRadius * searchRadius;
 
         for (int i = 0; i < edgePixels.Count; i++)
         {
@@ -391,19 +418,9 @@ public class DrawingController : MonoBehaviour
 
             for (int step = 0; step < 500; step++)
             {
-                int nearest = -1;
-                float minDist = searchRadius;
-                for (int j = 0; j < edgePixels.Count; j++)
-                {
-                    if (used[j]) continue;
-                    float dist = Vector2Int.Distance(edgePixels[current], edgePixels[j]);
-                    Color jColor = pixels[edgePixels[j].y * imgW + edgePixels[j].x];
-                    if (dist < minDist && ColorSimilar(jColor, pathColor))
-                    {
-                        minDist = dist;
-                        nearest = j;
-                    }
-                }
+                int nearest = FindNearestUnusedInGrid(
+                    edgePixels, grid, cellSize, used, current, pathColor, pixels, imgW, searchRadiusSq);
+
                 if (nearest == -1) break;
                 used[nearest] = true;
                 current = nearest;
@@ -420,6 +437,46 @@ public class DrawingController : MonoBehaviour
         return lastBuiltGroups;
     }
 
+    // 현재 점 기준 3x3 인접 그리드 셀 안에서만 "색이 비슷하면서 가장 가까운 미사용 점"을 찾음
+    // (예전: edgePixels 전체를 매번 선형탐색 → O(N).  이제: 인접 셀의 점들만 검사 → 거의 O(1)~O(k))
+    int FindNearestUnusedInGrid(
+        List<Vector2Int> points, Dictionary<Vector2Int, List<int>> grid, int cellSize,
+        bool[] used, int currentIdx, Color pathColor, Color[] pixels, int imgW, float searchRadiusSq)
+    {
+        Vector2Int p = points[currentIdx];
+        Vector2Int currentCell = new Vector2Int(p.x / cellSize, p.y / cellSize);
+
+        int nearest = -1;
+        float minDistSq = searchRadiusSq;
+
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                Vector2Int cell = new Vector2Int(currentCell.x + dx, currentCell.y + dy);
+                if (!grid.TryGetValue(cell, out var indices)) continue;
+
+                foreach (int j in indices)
+                {
+                    if (used[j]) continue;
+
+                    Vector2Int diff = points[j] - p;
+                    float distSq = diff.x * diff.x + diff.y * diff.y;
+                    if (distSq >= minDistSq) continue;
+
+                    Color jColor = pixels[points[j].y * imgW + points[j].x];
+                    if (ColorSimilar(jColor, pathColor))
+                    {
+                        minDistSq = distSq;
+                        nearest = j;
+                    }
+                }
+            }
+        }
+
+        return nearest;
+    }
+
     float GetBrightness(Color c) => (c.r + c.g + c.b) / 3f;
 
     List<List<Vector2>> GetAllPathsSorted()
@@ -428,19 +485,22 @@ public class DrawingController : MonoBehaviour
         foreach (var g in lastBuiltGroups)
             allPaths.AddRange(g.paths);
 
-        List<List<Vector2>> sorted = new List<List<Vector2>>();
-        List<bool> used = new List<bool>(new bool[allPaths.Count]);
+        List<List<Vector2>> sorted = new List<List<Vector2>>(allPaths.Count);
+        bool[] used = new bool[allPaths.Count];
         Vector2 currentPos = new Vector2(0.5f, 0.5f);
 
+        // 참고: 경로 개수(P)는 보통 엣지 픽셀 수보다 훨씬 작아(수십~수백 단위)
+        // O(P²)라도 실질적인 병목이 되는 경우는 드뭅니다.
+        // 만약 P가 수천 단위로 커지면 BuildStrokeGroups와 동일한 그리드 기법을 적용하세요.
         while (sorted.Count < allPaths.Count)
         {
-            float minDist = float.MaxValue;
+            float minDistSq = float.MaxValue;
             int nearest = 0;
             for (int i = 0; i < allPaths.Count; i++)
             {
                 if (used[i] || allPaths[i].Count == 0) continue;
-                float dist = Vector2.Distance(currentPos, allPaths[i][0]);
-                if (dist < minDist) { minDist = dist; nearest = i; }
+                float distSq = (currentPos - allPaths[i][0]).sqrMagnitude;
+                if (distSq < minDistSq) { minDistSq = distSq; nearest = i; }
             }
             sorted.Add(allPaths[nearest]);
             currentPos = allPaths[nearest][allPaths[nearest].Count - 1];
@@ -677,10 +737,17 @@ public class DrawingController : MonoBehaviour
 
     float ColorDistance(Color a, Color b)
     {
-        return Mathf.Sqrt(
-            (a.r - b.r) * (a.r - b.r) +
-            (a.g - b.g) * (a.g - b.g) +
-            (a.b - b.b) * (a.b - b.b));
+        return Mathf.Sqrt(ColorDistanceSq(a, b));
+    }
+
+    // [최적화] sqrt 없는 제곱 거리. 임계값 비교용으로는 ColorDistance와 동일하게 쓸 수 있음
+    // (threshold도 제곱해서 비교하면 결과가 같음: a < b  ⇔  a² < b² , a,b ≥ 0)
+    float ColorDistanceSq(Color a, Color b)
+    {
+        float dr = a.r - b.r;
+        float dg = a.g - b.g;
+        float db = a.b - b.b;
+        return dr * dr + dg * dg + db * db;
     }
 
     bool IsBackground(Color pixel, Color bgColor)
@@ -688,10 +755,11 @@ public class DrawingController : MonoBehaviour
         if (pixel.a < 0.1f) return true;
         if (bgColor.a < 0.1f)
             return (pixel.r + pixel.g + pixel.b) / 3f > backgroundThreshold;
-        float diff = ColorDistance(pixel, bgColor);
+        float diffSq = ColorDistanceSq(pixel, bgColor);
         float bgBrightness = (bgColor.r + bgColor.g + bgColor.b) / 3f;
-        float threshold = bgBrightness < 0.2f ? 0.25f : 0.15f;
-        return diff < threshold;
+        // 원래 threshold(0.25 / 0.15)를 제곱한 값으로 비교 (sqrt 제거)
+        float thresholdSq = bgBrightness < 0.2f ? 0.0625f : 0.0225f;
+        return diffSq < thresholdSq;
     }
 
     void AddPathToGroup(List<StrokeGroup> groups, Color color, List<Vector2> path)
